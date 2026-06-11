@@ -6,3 +6,7 @@ duckdb
 requests
 pdfplumber
 fredapi
+python-dotenv
+beautifulsoup4
+lxml
+pyarrow

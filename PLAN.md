@@ -7,13 +7,13 @@
 ## Build order
 
 ### Phase 1 — Ingestion
-- [ ] `ingestion/edgar.py` — pull Alaska Air Group 10-K/10-Q from EDGAR API, save to parquet
-- [ ] `ingestion/fred.py` — pull jet fuel price history from FRED API
-- [ ] `ingestion/ir_pdfs.py` — parse Alaska IR supplemental PDFs (RASM, CASM, ASMs, load factor)
-- [ ] `ingestion/bts.py` — download and parse BTS T-100 international + DB1B route data
+- [x] `ingestion/edgar.py` — EDGAR XBRL company facts → quarterly financials.parquet
+- [x] `ingestion/fred.py` — FRED WPSFD4111 → fuel_prices.parquet (requires .env FRED_API_KEY)
+- [x] `ingestion/ir_pdfs.py` — EDGAR 8-K monthly traffic releases → traffic_stats.parquet (ASMs, RPMs, load factor, passengers)
+- [x] `ingestion/bts.py` — BTS T-100 International + DB1B → route_data.parquet (AS SEA→FCO/KEF/ICN/NRT)
 
 ### Phase 2 — Models
-- [ ] `models/unit_economics.py` — RASM, CASM, CASM ex-fuel, load factor calculations
+- [x] `models/unit_economics.py` — RASM, CASM, CASM ex-fuel, load factor, margins; add_q4() to derive Q4 from FY-Q1-Q2-Q3
 - [ ] `models/scenarios.py` — fuel shock, hedge ratio, load factor scenario functions
 - [ ] `models/routes.py` — route revenue proxy, load factor and fare trends by route
 

@@ -18,6 +18,9 @@ data/processed/ — cleaned parquet / DuckDB (gitignored)
 app.py        — Streamlit entry point
 ```
 
+## Git rules
+- Never include "Co-Authored-By: Claude" or any AI attribution in commit messages.
+
 ## Key rules
 - Keep models/ pure — no I/O, no API calls, no Streamlit imports. Functions take DataFrames, return DataFrames or scalars.
 - Ingestion scripts save to data/raw/ and data/processed/ — never hardcode paths, use pathlib relative to repo root.
