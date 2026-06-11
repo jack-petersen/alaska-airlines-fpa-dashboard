@@ -1,0 +1,8 @@
+streamlit
+plotly
+pandas
+numpy
+duckdb
+requests
+pdfplumber
+fredapi
