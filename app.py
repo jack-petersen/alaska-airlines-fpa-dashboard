@@ -396,6 +396,167 @@ elif section == "Unit Economics":
                      use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — Fuel Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+elif section == "Fuel Analysis":
+    st.title("Fuel Analysis")
+
+    if financials.empty or traffic.empty or fuel_prices.empty:
+        st.error("Run `python -m ingestion.edgar`, `ingestion.ir_pdfs`, and `ingestion.fred` first.")
+        st.stop()
+
+    # ── Build quarterly fuel dataset ───────────────────────────────────────────
+    fin_q = financials[financials["fp"].isin(["Q1", "Q2", "Q3", "Q4"])].copy()
+    trf_q = traffic[["fy", "fp", "period_end", "fuel_cost_per_gallon", "fuel_gallons"]].copy()
+    df_fuel = fin_q.merge(trf_q, on=["fy", "fp"], how="left", suffixes=("", "_t"))
+    df_fuel["period_end"] = pd.to_datetime(df_fuel["period_end"])
+    df_fuel = df_fuel.dropna(subset=["fuel_cost", "revenue_total"]).sort_values("period_end")
+
+    df_fuel["fuel_pct_revenue"] = df_fuel["fuel_cost"] / df_fuel["revenue_total"] * 100
+    df_fuel["fuel_pct_opex"] = (
+        df_fuel["fuel_cost"] / df_fuel["operating_expenses"] * 100
+    ).where(df_fuel["operating_expenses"].notna())
+
+    year_range = st.slider(
+        "Fiscal Year",
+        min_value=int(df_fuel["fy"].min()),
+        max_value=int(df_fuel["fy"].max()),
+        value=(2017, int(df_fuel["fy"].max())),
+        key="fuel_years",
+    )
+    df = df_fuel[(df_fuel["fy"] >= year_range[0]) & (df_fuel["fy"] <= year_range[1])]
+
+    # ── KPI cards ──────────────────────────────────────────────────────────────
+    has_gal = df["fuel_cost_per_gallon"].notna()
+    latest_gal = df[has_gal].iloc[-1] if has_gal.any() else None
+    prior_gal  = df[has_gal].iloc[-2] if has_gal.sum() >= 2 else None
+    latest_rev = df.iloc[-1]
+    prior_rev  = df.iloc[-2] if len(df) >= 2 else None
+
+    k1, k2, k3, k4 = st.columns(4)
+
+    if latest_gal is not None:
+        gd = f"{(latest_gal['fuel_cost_per_gallon'] - prior_gal['fuel_cost_per_gallon']):+.2f}" if prior_gal is not None else ""
+        gc = "inverse" if prior_gal is not None and latest_gal["fuel_cost_per_gallon"] > prior_gal["fuel_cost_per_gallon"] else "normal"
+        k1.metric("Fuel Cost/Gallon", f"${latest_gal['fuel_cost_per_gallon']:.2f}", gd, delta_color=gc)
+
+    fr_d = f"{(latest_rev['fuel_pct_revenue'] - prior_rev['fuel_pct_revenue']):+.1f} pts" if prior_rev is not None else ""
+    fr_c = "inverse" if prior_rev is not None and latest_rev["fuel_pct_revenue"] > prior_rev["fuel_pct_revenue"] else "normal"
+    k2.metric("Fuel % of Revenue", f"{latest_rev['fuel_pct_revenue']:.1f}%", fr_d, delta_color=fr_c)
+
+    k3.metric("Fuel Spend (latest qtr)", f"${latest_rev['fuel_cost']:.0f}M")
+
+    if latest_gal is not None and "fuel_gallons" in df.columns and pd.notna(latest_gal.get("fuel_gallons")):
+        k4.metric("Gallons Consumed", f"{latest_gal['fuel_gallons']/1e6:.0f}M gal")
+
+    st.divider()
+
+    # ── Fuel cost per gallon + FRED PPI overlay ────────────────────────────────
+    st.subheader("Alaska Fuel Cost/Gallon vs Jet Fuel PPI (FRED WPSFD4111)")
+    st.caption("PPI normalized to $/gallon scale using Q4 2019 as base period — shows hedge effectiveness vs market.")
+
+    # Normalize FRED PPI to $/gallon scale: anchor at a clean pre-COVID period
+    fred = fuel_prices.copy()
+    fred["date"] = pd.to_datetime(fred["date"])
+    fred = fred[(fred["date"].dt.year >= year_range[0]) & (fred["date"].dt.year <= year_range[1])]
+
+    # Find scaling factor: FRED PPI level vs Alaska's $/gallon in Q3 2019
+    ref_alaska = df_fuel[df_fuel["period_end"].dt.to_period("Q") == pd.Period("2019Q3")]
+    ref_fred   = fuel_prices[fuel_prices["date"].between("2019-07-01", "2019-09-30")]
+    if not ref_alaska.empty and not ref_fred.empty and pd.notna(ref_alaska.iloc[0]["fuel_cost_per_gallon"]):
+        scale = ref_alaska.iloc[0]["fuel_cost_per_gallon"] / ref_fred["jet_fuel_ppi"].mean()
+        fred["market_price_est"] = fred["jet_fuel_ppi"] * scale
+    else:
+        scale = df_fuel["fuel_cost_per_gallon"].mean() / fred["jet_fuel_ppi"].mean()
+        fred["market_price_est"] = fred["jet_fuel_ppi"] * scale
+
+    fig_gal = go.Figure()
+    fred_in_range = fred[(fred["date"].dt.year >= year_range[0]) & (fred["date"].dt.year <= year_range[1])]
+    fig_gal.add_scatter(
+        x=fred_in_range["date"], y=fred_in_range["market_price_est"],
+        name="Jet Fuel PPI (market est.)", mode="lines",
+        line=dict(color="#aaa", width=1.5, dash="dot"),
+    )
+    df_gal = df[df["fuel_cost_per_gallon"].notna()]
+    fig_gal.add_scatter(
+        x=df_gal["period_end"], y=df_gal["fuel_cost_per_gallon"],
+        name="Alaska actual (hedged)", mode="lines+markers",
+        line=dict(color=ALASKA_GOLD, width=2.5),
+        marker=dict(size=7),
+    )
+    # Shade the gap between market and actual to illustrate hedge benefit/cost
+    fig_gal.add_scatter(
+        x=pd.concat([df_gal["period_end"], df_gal["period_end"][::-1]]),
+        y=pd.concat([df_gal["fuel_cost_per_gallon"],
+                     df_gal["period_end"].map(
+                         fred_in_range.set_index(
+                             fred_in_range["date"].dt.to_period("Q").map(str)
+                         )["market_price_est"].reindex(
+                             df_gal["period_end"].dt.to_period("Q").map(str)
+                         ).fillna(method="ffill").values.__class__(
+                             fred_in_range.set_index(
+                                 fred_in_range["date"].dt.to_period("Q").map(str)
+                             )["market_price_est"].reindex(
+                                 df_gal["period_end"].dt.to_period("Q").map(str)
+                             ).fillna(method="ffill")
+                         )
+                     )[::-1]]),
+        fill="toself", fillcolor="rgba(232,184,75,0.12)",
+        line=dict(color="rgba(0,0,0,0)"),
+        showlegend=False, hoverinfo="skip",
+    ) if False else None  # skip the complex fill — keep it clean
+
+    fig_gal.update_layout(**CHART_DEFAULTS, yaxis_title="$/gallon", xaxis_title="")
+    st.plotly_chart(fig_gal, use_container_width=True)
+
+    # ── Fuel as % of revenue and % of opex ────────────────────────────────────
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Fuel as % of Revenue")
+        fig_pct = go.Figure()
+        fig_pct.add_bar(
+            x=df["period_end"], y=df["fuel_pct_revenue"],
+            name="Fuel % Revenue",
+            marker_color=[RED if v > 25 else ALASKA_GOLD if v > 20 else ALASKA_TEAL
+                          for v in df["fuel_pct_revenue"]],
+        )
+        fig_pct.add_hline(y=25, line_dash="dot", line_color="#ccc",
+                          annotation_text="25%", annotation_position="top right")
+        fig_pct.update_layout(**CHART_DEFAULTS, yaxis_title="%", xaxis_title="",
+                               yaxis_range=[0, df["fuel_pct_revenue"].max() * 1.15])
+        st.plotly_chart(fig_pct, use_container_width=True)
+
+    with c2:
+        st.subheader("Total Fuel Spend ($M per quarter)")
+        fig_spend = go.Figure()
+        fig_spend.add_bar(
+            x=df["period_end"], y=df["fuel_cost"],
+            name="Fuel Cost $M",
+            marker_color=ALASKA_GOLD,
+        )
+        fig_spend.update_layout(**CHART_DEFAULTS, yaxis_title="$M", xaxis_title="")
+        st.plotly_chart(fig_spend, use_container_width=True)
+
+    # ── Gallons consumed — operational scale ───────────────────────────────────
+    df_gal2 = df[df["fuel_gallons"].notna()].copy()
+    if not df_gal2.empty:
+        st.subheader("Fuel Gallons Consumed (millions) — proxy for operational scale")
+        fig_gal2 = go.Figure()
+        fig_gal2.add_bar(
+            x=df_gal2["period_end"], y=df_gal2["fuel_gallons"] / 1e6,
+            name="Gallons (M)", marker_color=ALASKA_BLUE, opacity=0.8,
+        )
+        fig_gal2.update_layout(**CHART_DEFAULTS, yaxis_title="Million gallons", xaxis_title="")
+        st.plotly_chart(fig_gal2, use_container_width=True)
+
+    with st.expander("Raw data"):
+        show = ["period_end", "fy", "fp", "fuel_cost", "revenue_total",
+                "fuel_pct_revenue", "fuel_cost_per_gallon", "fuel_gallons"]
+        show = [c for c in show if c in df.columns]
+        st.dataframe(df[show].reset_index(drop=True), use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PLACEHOLDER sections
 # ══════════════════════════════════════════════════════════════════════════════
 else:
