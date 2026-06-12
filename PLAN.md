@@ -1,6 +1,6 @@
 # Project Plan & Build Tracker
 
-## Status: In progress — ingestion layer next
+## Status: Phase 3 complete — all 6 dashboard sections live
 
 ---
 
@@ -10,20 +10,19 @@
 - [x] `ingestion/edgar.py` — EDGAR XBRL company facts → quarterly financials.parquet
 - [x] `ingestion/fred.py` — FRED WPSFD4111 → fuel_prices.parquet (requires .env FRED_API_KEY)
 - [x] `ingestion/ir_pdfs.py` — EDGAR 8-K monthly traffic releases → traffic_stats.parquet (ASMs, RPMs, load factor, passengers)
-- [x] `ingestion/bts.py` — BTS T-100 International + DB1B → route_data.parquet (AS SEA→FCO/KEF/ICN/NRT)
+- [x] `ingestion/bts.py` — BTS T-100 All-Carrier form POST → route_data.parquet (AS SEA hub, intl + domestic top routes)
 
 ### Phase 2 — Models
 - [x] `models/unit_economics.py` — RASM, CASM, CASM ex-fuel, load factor, margins; add_q4() to derive Q4 from FY-Q1-Q2-Q3
-- [ ] `models/scenarios.py` — fuel shock, hedge ratio, load factor scenario functions
-- [ ] `models/routes.py` — route revenue proxy, load factor and fare trends by route
+- [x] `models/scenarios.py` — fuel shock, hedge ratio, load factor scenario functions
 
 ### Phase 3 — Dashboard (sections in order)
-- [ ] Section 1: Income Statement Overview
-- [ ] Section 2: Unit Economics
-- [ ] Section 3: Ancillary Revenue
-- [ ] Section 4: Fuel Analysis
-- [ ] Section 5: Scenario Planner
-- [ ] Section 6: Route Analysis (implement last)
+- [x] Section 1: Income Statement Overview
+- [x] Section 2: Unit Economics
+- [x] Section 3: Ancillary Revenue
+- [x] Section 4: Fuel Analysis
+- [x] Section 5: Scenario Planner
+- [x] Section 6: Route Analysis
 
 ### Phase 4 — Deploy
 - [ ] Connect repo to Streamlit Community Cloud

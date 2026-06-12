@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from models.unit_economics import add_q4
-from models.scenarios import Baseline, run_scenario
+from models.scenarios import Baseline, run_scenario, MARGINAL_COST_RATE
 
 PROCESSED = Path(__file__).parent / "data" / "processed"
 
@@ -77,10 +77,21 @@ def load_traffic() -> pd.DataFrame:
     return df
 
 
+@st.cache_data
+def load_routes() -> pd.DataFrame:
+    path = PROCESSED / "route_data.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
 financials = load_financials()
 fuel_prices = load_fuel_prices()
 traffic = load_traffic()
 rev_breakdown = load_revenue_breakdown()
+routes = load_routes()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -858,9 +869,271 @@ maintenance, overhead) which are not modelled here.
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLACEHOLDER sections
+# SECTION 6 — Route Analysis
 # ══════════════════════════════════════════════════════════════════════════════
-else:
-    st.title(section)
-    st.info(f"**{section}** — coming soon. Run the relevant ingestion scripts first, then this section will be built out.")
-    st.caption("Build order: Income Statement → Unit Economics → Ancillary → Fuel → Scenario → Routes")
+elif section == "Route Analysis":
+    st.title("Route Analysis — SEA Hub")
+    st.caption(
+        "BTS T-100 All-Carrier data: Alaska Airlines (AS) segments departing SEA. "
+        "International routes include Mexico, Canada, Caribbean, and Iceland. "
+        "Domestic routes show the top SEA-origin city pairs by passenger volume."
+    )
+
+    if routes.empty:
+        st.error("No route data found. Run `python -m ingestion.bts` first.")
+        st.stop()
+
+    # ── Filters ────────────────────────────────────────────────────────────────
+    col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
+    with col_f1:
+        year_range = st.slider(
+            "Year range",
+            min_value=int(routes["YEAR"].min()),
+            max_value=int(routes["YEAR"].max()),
+            value=(2018, int(routes["YEAR"].max())),
+            key="route_years",
+        )
+    with col_f2:
+        route_type_filter = st.radio(
+            "Route type", ["All", "International", "Domestic"], horizontal=True
+        )
+    with col_f3:
+        min_pax = st.number_input(
+            "Min total pax (000s)", min_value=0, value=100, step=50,
+            help="Hide routes with fewer than this many cumulative passengers (thousands)"
+        ) * 1000
+
+    df_r = routes[
+        (routes["YEAR"] >= year_range[0]) & (routes["YEAR"] <= year_range[1])
+    ].copy()
+    if route_type_filter != "All":
+        df_r = df_r[df_r["route_type"] == route_type_filter]
+
+    # Filter to routes meeting minimum pax threshold
+    pax_by_dest = df_r.groupby("DEST")["PASSENGERS"].sum()
+    active_dests = pax_by_dest[pax_by_dest >= min_pax].index
+    df_r = df_r[df_r["DEST"].isin(active_dests)]
+
+    if df_r.empty:
+        st.warning("No routes match the current filters.")
+        st.stop()
+
+    # ── KPI cards ──────────────────────────────────────────────────────────────
+    intl_mask = df_r["route_type"] == "International"
+    total_pax = df_r["PASSENGERS"].sum()
+    intl_pax = df_r[intl_mask]["PASSENGERS"].sum()
+    intl_routes_n = df_r[intl_mask]["DEST"].nunique()
+    top_route = pax_by_dest[pax_by_dest.index.isin(df_r["DEST"])].idxmax()
+    avg_lf = df_r["load_factor"].mean()
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Passengers (filtered)", f"{total_pax/1e6:.1f}M")
+    k2.metric("International Routes Active", str(intl_routes_n))
+    k3.metric(f"Top Route (SEA→{top_route})", f"{pax_by_dest[top_route]/1e6:.1f}M pax")
+    k4.metric("Avg Load Factor", f"{avg_lf:.1f}%")
+
+    st.divider()
+
+    # ── Passenger trend by route (line chart) ─────────────────────────────────
+    st.subheader("Monthly Passengers by Route (thousands)")
+
+    # Aggregate to monthly totals per destination
+    monthly = (
+        df_r.groupby(["date", "DEST", "route_type"])["PASSENGERS"]
+        .sum()
+        .reset_index()
+    )
+    monthly["pax_k"] = monthly["PASSENGERS"] / 1000
+
+    # Sort destinations by total pax for legend order
+    dest_order = (
+        monthly.groupby("DEST")["PASSENGERS"].sum()
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+
+    # Color palette: internationals get distinct warm colors, domestics cooler
+    intl_colors = [ALASKA_GOLD, "#E06020", "#C8102E", "#7B3F9E", "#E8884B", "#B05020"]
+    dom_colors  = [ALASKA_TEAL, ALASKA_BLUE, ALASKA_GREEN,
+                   "#3FA0CC", "#5090B0", "#709080", "#9090A0", "#7080C0",
+                   "#508070", "#406080", "#605090", "#806070"]
+
+    intl_dests = [d for d in dest_order if d in monthly[monthly["route_type"] == "International"]["DEST"].unique()]
+    dom_dests  = [d for d in dest_order if d in monthly[monthly["route_type"] == "Domestic"]["DEST"].unique()]
+
+    fig_trend = go.Figure()
+    for i, dest in enumerate(intl_dests):
+        sub = monthly[monthly["DEST"] == dest]
+        fig_trend.add_scatter(
+            x=sub["date"], y=sub["pax_k"],
+            name=f"SEA→{dest} (Intl)",
+            mode="lines",
+            line=dict(color=intl_colors[i % len(intl_colors)], width=2.5),
+        )
+    for i, dest in enumerate(dom_dests):
+        sub = monthly[monthly["DEST"] == dest]
+        fig_trend.add_scatter(
+            x=sub["date"], y=sub["pax_k"],
+            name=f"SEA→{dest}",
+            mode="lines",
+            line=dict(color=dom_colors[i % len(dom_colors)], width=1.5),
+        )
+
+    fig_trend.update_layout(
+        **{**CHART_DEFAULTS, "legend": dict(orientation="v", x=1.01, y=1, font=dict(size=11))},
+        yaxis_title="Passengers (000s)",
+        xaxis_title="",
+    )
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    # ── Route comparison bar chart ─────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Total Passengers by Route (selected period)")
+        bar_data = (
+            df_r.groupby(["DEST", "route_type"])["PASSENGERS"].sum()
+            .reset_index()
+            .sort_values("PASSENGERS", ascending=True)
+        )
+        bar_data["pax_m"] = bar_data["PASSENGERS"] / 1e6
+        fig_bar = go.Figure()
+        for rt, color in [("International", ALASKA_GOLD), ("Domestic", ALASKA_TEAL)]:
+            sub = bar_data[bar_data["route_type"] == rt]
+            if sub.empty:
+                continue
+            fig_bar.add_bar(
+                y=sub["DEST"].apply(lambda d: f"SEA→{d}"),
+                x=sub["pax_m"],
+                name=rt,
+                orientation="h",
+                marker_color=color,
+            )
+        fig_bar.update_layout(
+            **{**CHART_DEFAULTS, "legend": dict(orientation="h", y=1.05),
+               "margin": dict(l=60, r=0, t=36, b=0)},
+            xaxis_title="Passengers (M)",
+            yaxis_title="",
+            barmode="stack",
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    with c2:
+        st.subheader("Average Load Factor by Route (%)")
+        lf_data = (
+            df_r.groupby(["DEST", "route_type"])["load_factor"]
+            .mean()
+            .reset_index()
+            .sort_values("load_factor", ascending=True)
+        )
+        fig_lf = go.Figure()
+        for rt, color in [("International", ALASKA_GOLD), ("Domestic", ALASKA_TEAL)]:
+            sub = lf_data[lf_data["route_type"] == rt]
+            if sub.empty:
+                continue
+            fig_lf.add_bar(
+                y=sub["DEST"].apply(lambda d: f"SEA→{d}"),
+                x=sub["load_factor"],
+                name=rt,
+                orientation="h",
+                marker_color=color,
+            )
+        fig_lf.add_vline(x=80, line_dash="dot", line_color="#aaa",
+                         annotation_text="80%", annotation_position="top")
+        fig_lf.update_layout(
+            **{**CHART_DEFAULTS, "legend": dict(orientation="h", y=1.05),
+               "margin": dict(l=60, r=0, t=36, b=0)},
+            xaxis_title="Load Factor (%)",
+            yaxis_title="",
+            xaxis_range=[0, 105],
+            barmode="stack",
+        )
+        st.plotly_chart(fig_lf, use_container_width=True)
+
+    # ── Seasonality heatmap ────────────────────────────────────────────────────
+    st.subheader("Seasonality — Average Monthly Passengers by Route (000s)")
+    st.caption("Average passengers per month across the selected year range.")
+
+    heat_data = (
+        df_r.groupby(["DEST", "MONTH"])["PASSENGERS"]
+        .mean()
+        .reset_index()
+    )
+    heat_data["pax_k"] = heat_data["PASSENGERS"] / 1000
+
+    month_labels = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                    7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+
+    # Build pivot table: routes × months
+    pivot = heat_data.pivot(index="DEST", columns="MONTH", values="pax_k").fillna(0)
+    pivot = pivot.reindex(sorted(pivot.index,
+                                  key=lambda d: -df_r.groupby("DEST")["PASSENGERS"].sum().get(d, 0)))
+    pivot.columns = [month_labels[m] for m in pivot.columns]
+
+    row_labels = [f"SEA→{d}" for d in pivot.index]
+
+    fig_heat = go.Figure(go.Heatmap(
+        z=pivot.values,
+        x=pivot.columns.tolist(),
+        y=row_labels,
+        colorscale=[
+            [0.0, "#f0f4f8"],
+            [0.3, ALASKA_TEAL],
+            [0.7, ALASKA_BLUE],
+            [1.0, ALASKA_GOLD],
+        ],
+        hovertemplate="%{y}<br>%{x}: %{z:.1f}k pax<extra></extra>",
+        text=pivot.values.round(0).astype(int),
+        texttemplate="%{text}",
+        textfont=dict(size=9),
+    ))
+    fig_heat.update_layout(
+        **{**CHART_DEFAULTS, "margin": dict(l=80, r=0, t=36, b=0)},
+        xaxis_title="Month",
+        yaxis_title="",
+        height=max(300, 30 * len(pivot)),
+    )
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ── Year-over-year international passenger growth ─────────────────────────
+    intl_routes = df_r[df_r["route_type"] == "International"]
+    if not intl_routes.empty:
+        st.subheader("International Route Passenger Growth — Year over Year (%)")
+        annual_intl = (
+            intl_routes.groupby(["YEAR", "DEST"])["PASSENGERS"]
+            .sum()
+            .reset_index()
+            .sort_values(["DEST", "YEAR"])
+        )
+        annual_intl["yoy_pct"] = annual_intl.groupby("DEST")["PASSENGERS"].pct_change() * 100
+
+        fig_yoy = go.Figure()
+        for i, dest in enumerate(annual_intl["DEST"].unique()):
+            sub = annual_intl[annual_intl["DEST"] == dest].dropna(subset=["yoy_pct"])
+            if sub.empty:
+                continue
+            fig_yoy.add_scatter(
+                x=sub["YEAR"], y=sub["yoy_pct"],
+                name=f"SEA→{dest}",
+                mode="lines+markers",
+                line=dict(color=intl_colors[i % len(intl_colors)], width=2),
+            )
+        fig_yoy.add_hline(y=0, line_dash="dash", line_color="#aaa")
+        fig_yoy.update_layout(
+            **CHART_DEFAULTS,
+            yaxis_title="% YoY",
+            xaxis_title="Year",
+            xaxis=dict(tickmode="linear", dtick=1),
+        )
+        st.plotly_chart(fig_yoy, use_container_width=True)
+
+    # ── Raw data ───────────────────────────────────────────────────────────────
+    with st.expander("Raw monthly route data"):
+        show_cols = ["date", "YEAR", "MONTH", "DEST", "route_type",
+                     "PASSENGERS", "SEATS", "DEPARTURES_PERFORMED",
+                     "DISTANCE", "load_factor"]
+        show_cols = [c for c in show_cols if c in df_r.columns]
+        st.dataframe(
+            df_r[show_cols].sort_values(["DEST", "date"]).reset_index(drop=True),
+            use_container_width=True,
+        )

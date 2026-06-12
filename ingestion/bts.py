@@ -1,207 +1,174 @@
 """
-Download BTS T-100 International Segment data for Alaska Air (carrier AS) from SEA.
-Filters to long-haul routes: SEA→FCO, SEA→KEF, SEA→ICN, SEA→NRT.
-Also downloads DB1B fare data for the same routes.
+Download BTS T-100 All-Carrier Segment data for Alaska Air (carrier AS) from SEA.
+Shows Alaska's actual international + top domestic routes out of Seattle.
 
-Saves route data to data/processed/route_data.parquet.
+Uses the BTS form POST download (no pre-built PREZIP URLs exist for this table).
+Downloads one year at a time, caches raw parquets in data/raw/bts/.
+
+Saves: data/processed/route_data.parquet
 
 Run: python -m ingestion.bts
 """
 
 import io
+import time
 import zipfile
 from pathlib import Path
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 
 REPO_ROOT = Path(__file__).parent.parent
-RAW_DIR = REPO_ROOT / "data" / "raw"
+RAW_DIR = REPO_ROOT / "data" / "raw" / "bts"
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
 BTS_HEADERS = {
     "User-Agent": "FPA Dashboard johnhenrypetersen@gmail.com",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+BTS_FORM_URL = (
+    "https://www.transtats.bts.gov/DL_SelectFields.aspx"
+    "?gnoyr_VQ=FMG&QO_fu146_anzr=Nv4+Pn44vr4+fgngvfgvpf"
+)
 
 CARRIER = "AS"
 ORIGIN = "SEA"
-TARGET_DESTINATIONS = {"FCO", "KEF", "ICN", "NRT"}
 START_YEAR = 2016
 
-# BTS T-100 International Segment bulk download URL pattern
-# One zip file per year containing all carriers' international segments
-T100_URL_TEMPLATE = (
-    "https://transtats.bts.gov/PREZIP/T_T100_SEGMENT_INT_CARRIER_{year}.zip"
-)
+# Alaska's actual international destinations from SEA as of 2016–present
+INTL_DESTINATIONS = {"KEF", "CUN", "PVR", "SJD", "GDL", "YVR", "SJO", "BZE", "MBJ", "MEX"}
 
-# DB1B Coupon data (origin-destination fares) — quarterly zip
-DB1B_URL_TEMPLATE = (
-    "https://transtats.bts.gov/PREZIP/Origin_and_Destination_Survey_DB1BCoupon_{year}_Q{q}.zip"
-)
+# Top domestic routes from SEA for comparison
+DOMESTIC_DESTINATIONS = {
+    "ANC", "LAX", "SFO", "PDX", "JFK", "BOS", "ORD", "DEN",
+    "ATL", "PHX", "SAN", "LAS", "HNL", "FAI",
+}
 
-# T-100 column names we want
-T100_COLS = [
-    "YEAR", "MONTH", "UNIQUE_CARRIER", "ORIGIN", "DEST",
-    "PASSENGERS", "SEATS", "FREIGHT", "MAIL", "DISTANCE",
-    "AIRCRAFT_TYPE", "DEPARTURES_PERFORMED",
-]
+TARGET_DESTINATIONS = INTL_DESTINATIONS | DOMESTIC_DESTINATIONS
 
-# DB1B column names we want
-DB1B_COLS = [
-    "YEAR", "QUARTER", "ORIGIN", "DEST", "PASSENGERS", "MARKET_FARE",
+T100_FIELDS = [
+    "DEPARTURES_PERFORMED", "SEATS", "PASSENGERS",
+    "UNIQUE_CARRIER", "UNIQUE_CARRIER_NAME",
+    "ORIGIN", "DEST", "YEAR", "MONTH", "DISTANCE",
 ]
 
 
-def _download_t100_year(year: int) -> pd.DataFrame | None:
-    cache_path = RAW_DIR / f"t100_int_{year}.parquet"
-    if cache_path.exists():
-        return pd.read_parquet(cache_path)
+def _download_year(year: int, session: requests.Session) -> pd.DataFrame | None:
+    """Download T-100 data for one full year via BTS form POST. Returns filtered Alaska rows."""
+    cache = RAW_DIR / f"t100_as_sea_{year}.parquet"
+    if cache.exists():
+        print(f"  {year}: using cache")
+        return pd.read_parquet(cache)
 
-    url = T100_URL_TEMPLATE.format(year=year)
-    print(f"  Downloading T-100 {year}...")
+    print(f"  {year}: fetching form...")
     try:
-        resp = requests.get(url, headers=BTS_HEADERS, timeout=120)
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        print(f"  Skipping {year}: {e}")
+        r = session.get(BTS_FORM_URL, headers=BTS_HEADERS, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  {year}: form GET failed: {e}")
         return None
 
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-        csv_name = next(n for n in z.namelist() if n.endswith(".csv"))
-        with z.open(csv_name) as f:
-            df = pd.read_csv(f, usecols=lambda c: c in T100_COLS, low_memory=False)
+    soup = BeautifulSoup(r.text, "lxml")
+    post_data: dict[str, str] = {}
+    for inp in soup.find_all("input", type="hidden"):
+        if inp.get("name"):
+            post_data[inp["name"]] = inp.get("value", "")
 
-    df.columns = df.columns.str.upper()
-    df.to_parquet(cache_path, index=False)
-    return df
+    post_data["affiliate"] = "dot-bts"
+    post_data["cboYear"] = str(year)
+    post_data["cboPeriod"] = "All"
+    post_data["__EVENTTARGET"] = ""
+    post_data["__EVENTARGUMENT"] = ""
+    post_data["btnDownload"] = "Download"
+    for field in T100_FIELDS:
+        post_data[field] = "on"
 
-
-def _download_db1b_quarter(year: int, q: int) -> pd.DataFrame | None:
-    cache_path = RAW_DIR / f"db1b_{year}_q{q}.parquet"
-    if cache_path.exists():
-        return pd.read_parquet(cache_path)
-
-    url = DB1B_URL_TEMPLATE.format(year=year, q=q)
-    print(f"  Downloading DB1B {year} Q{q}...")
+    print(f"  {year}: downloading (may take 30-90s)...")
     try:
-        resp = requests.get(url, headers=BTS_HEADERS, timeout=180)
+        resp = session.post(BTS_FORM_URL, data=post_data, headers=BTS_HEADERS,
+                            timeout=180, stream=True)
         resp.raise_for_status()
-    except requests.HTTPError as e:
-        print(f"  Skipping DB1B {year} Q{q}: {e}")
+    except requests.RequestException as e:
+        print(f"  {year}: POST failed: {e}")
         return None
 
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+    content = b"".join(resp.iter_content(65536))
+    if content[:4] != b"PK\x03\x04":
+        print(f"  {year}: response is not a zip ({len(content)} bytes)")
+        return None
+
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
         csv_name = next(n for n in z.namelist() if n.endswith(".csv"))
         with z.open(csv_name) as f:
-            df = pd.read_csv(f, usecols=lambda c: c in DB1B_COLS, low_memory=False)
+            df = pd.read_csv(f, low_memory=False)
 
     df.columns = df.columns.str.upper()
-    df.to_parquet(cache_path, index=False)
+
+    # Filter to Alaska from SEA immediately
+    df = df[
+        (df["UNIQUE_CARRIER"] == CARRIER)
+        & (df["ORIGIN"] == ORIGIN)
+    ].copy()
+
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache, index=False)
+    print(f"  {year}: {len(df)} Alaska SEA routes cached")
     return df
-
-
-def _build_t100(current_year: int) -> pd.DataFrame:
-    frames = []
-    for year in range(START_YEAR, current_year + 1):
-        df = _download_t100_year(year)
-        if df is None:
-            continue
-        # Filter: Alaska Air from SEA to target destinations
-        mask = (
-            (df["UNIQUE_CARRIER"] == CARRIER)
-            & (df["ORIGIN"] == ORIGIN)
-            & (df["DEST"].isin(TARGET_DESTINATIONS))
-        )
-        subset = df[mask].copy()
-        if not subset.empty:
-            frames.append(subset)
-
-    if not frames:
-        raise RuntimeError("No T-100 records found for AS SEA routes — check URL or carrier code.")
-
-    result = pd.concat(frames, ignore_index=True)
-    result["date"] = pd.to_datetime(
-        result["YEAR"].astype(str) + "-" + result["MONTH"].astype(str).str.zfill(2) + "-01"
-    )
-    return result
-
-
-def _build_db1b(current_year: int) -> pd.DataFrame:
-    frames = []
-    for year in range(START_YEAR, current_year + 1):
-        for q in range(1, 5):
-            df = _download_db1b_quarter(year, q)
-            if df is None:
-                continue
-            # Filter to our routes (both directions for fare data)
-            mask = (
-                (df["ORIGIN"] == ORIGIN)
-                & (df["DEST"].isin(TARGET_DESTINATIONS))
-            ) | (
-                (df["DEST"] == ORIGIN)
-                & (df["ORIGIN"].isin(TARGET_DESTINATIONS))
-            )
-            subset = df[mask].copy()
-            if not subset.empty:
-                frames.append(subset)
-
-    if not frames:
-        print("  Warning: no DB1B fare data found — route revenue proxies will be T-100 only.")
-        return pd.DataFrame()
-
-    result = pd.concat(frames, ignore_index=True)
-    # Normalize direction: always SEA as origin for consistency
-    swap = result["DEST"] == ORIGIN
-    result.loc[swap, ["ORIGIN", "DEST"]] = result.loc[swap, ["DEST", "ORIGIN"]].values
-    return result
-
-
-def _merge_t100_db1b(t100: pd.DataFrame, db1b: pd.DataFrame) -> pd.DataFrame:
-    if db1b.empty:
-        t100["avg_fare"] = None
-        return t100
-
-    fare_agg = (
-        db1b.groupby(["YEAR", "QUARTER", "DEST"])
-        .apply(lambda g: (g["MARKET_FARE"] * g["PASSENGERS"]).sum() / g["PASSENGERS"].sum())
-        .reset_index(name="avg_fare")
-    )
-    fare_agg["MONTH"] = fare_agg["QUARTER"].map({1: 2, 2: 5, 3: 8, 4: 11})  # quarter midpoint
-
-    merged = t100.merge(
-        fare_agg[["YEAR", "MONTH", "DEST", "avg_fare"]],
-        on=["YEAR", "MONTH", "DEST"],
-        how="left",
-    )
-    return merged
 
 
 def run() -> pd.DataFrame:
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     current_year = pd.Timestamp.now().year
+    # BTS data lags ~6 months; use prior year as safe upper bound
+    end_year = current_year - 1
 
-    print("Building T-100 International Segment dataset...")
-    t100 = _build_t100(current_year - 1)  # BTS lags ~1 year for finalized data
-    print(f"  T-100: {len(t100)} route-months for AS SEA routes")
+    session = requests.Session()
+    frames = []
 
-    print("Building DB1B fare dataset...")
-    db1b = _build_db1b(current_year - 1)
+    print(f"Downloading BTS T-100 for AS SEA routes {START_YEAR}–{end_year}...")
+    for year in range(START_YEAR, end_year + 1):
+        df = _download_year(year, session)
+        if df is not None and not df.empty:
+            frames.append(df)
+        time.sleep(1)  # be polite
 
-    print("Merging T-100 + DB1B...")
-    df = _merge_t100_db1b(t100, db1b)
+    if not frames:
+        raise RuntimeError("No T-100 data downloaded — check BTS connectivity.")
 
-    # Revenue proxy: passengers × avg_fare (where fare available)
-    if "avg_fare" in df.columns:
-        df["revenue_proxy"] = df["PASSENGERS"] * df["avg_fare"]
+    combined = pd.concat(frames, ignore_index=True)
+
+    # Filter to routes of interest (international + key domestic from SEA)
+    routes = combined[combined["DEST"].isin(TARGET_DESTINATIONS)].copy()
+
+    # Label route type
+    routes["route_type"] = routes["DEST"].apply(
+        lambda d: "International" if d in INTL_DESTINATIONS else "Domestic"
+    )
+
+    routes["date"] = pd.to_datetime(
+        routes["YEAR"].astype(str) + "-" + routes["MONTH"].astype(str).str.zfill(2) + "-01"
+    )
+
+    # Load factor proxy (T-100 seats vs passengers)
+    routes["load_factor"] = (routes["PASSENGERS"] / routes["SEATS"] * 100).clip(0, 100)
 
     out = PROCESSED_DIR / "route_data.parquet"
-    df.to_parquet(out, index=False)
-    print(f"Saved {len(df)} route-months → {out}")
-    print(df[["date", "DEST", "PASSENGERS", "SEATS", "avg_fare"]].tail(8).to_string())
-    return df
+    routes.to_parquet(out, index=False)
+    print(f"\nSaved {len(routes)} route-months → {out}")
+
+    summary = (
+        routes.groupby(["DEST", "route_type"])["PASSENGERS"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(20)
+    )
+    print("\nTop routes by total passengers (2016–present):")
+    print(summary.to_string())
+
+    return routes
 
 
 if __name__ == "__main__":
