@@ -1,8 +1,12 @@
 """
-Fetch Alaska Air Group operational statistics from EDGAR monthly traffic 8-K filings.
-Alaska files monthly traffic stats (ASMs, RPMs, load factor, passengers) as 8-Ks.
+Fetch Alaska Air Group quarterly operating statistics from earnings press releases.
 
-Saves monthly stats to data/processed/traffic_stats.parquet.
+Alaska files earnings 8-Ks (item 2.02) with an EX-99.1 press release that contains
+an "OPERATING STATISTICS SUMMARY" table with RASM, CASMex, ASMs, RPMs, load factor,
+fuel cost per gallon, and fuel gallons.  We extract the "Three Months Ended" column
+(not the YTD column) to get quarterly data aligned with the financial model.
+
+Saves to data/processed/traffic_stats.parquet.
 
 Run: python -m ingestion.ir_pdfs
 """
@@ -14,7 +18,10 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+import warnings
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 REPO_ROOT = Path(__file__).parent.parent
 RAW_DIR = REPO_ROOT / "data" / "raw"
@@ -24,202 +31,262 @@ CIK = "0000766421"
 EDGAR_HEADERS = {"User-Agent": "FPA Dashboard johnhenrypetersen@gmail.com"}
 START_YEAR = 2016
 
-# Regex patterns for metric rows in traffic stat tables (handles various label formats)
-METRIC_PATTERNS = {
-    "asm": re.compile(r"available seat miles?", re.I),
-    "rpm": re.compile(r"revenue passenger miles?", re.I),
-    "load_factor": re.compile(r"passenger load factor|load factor", re.I),
-    "passengers": re.compile(r"revenue passengers?", re.I),
-    "departures": re.compile(r"airline departures?|departures?", re.I),
-}
+# ── Metric definitions ─────────────────────────────────────────────────────────
+# Each entry: (output column, regex to match row label, unit multiplier, value type)
+# value types: 'cents' (e.g. "17.30¢"), 'pct' (e.g. "86.5%"), 'num' (plain number)
 
-# Multipliers to normalize to raw units (ASMs/RPMs reported in millions or thousands)
-UNIT_PATTERNS = {
-    re.compile(r"\(000\)", re.I): 1_000,
-    re.compile(r"\(millions?\)", re.I): 1_000_000,
-    re.compile(r"\(000s?\)", re.I): 1_000,
-}
+METRICS = [
+    ("passengers",           re.compile(r"revenue passengers", re.I),          1_000,     "num"),
+    ("rpm",                  re.compile(r"RPMs?\s*\(000,000\)", re.I),          1_000_000, "num"),
+    ("asm",                  re.compile(r"ASMs?\s*\(000,000\)", re.I),          1_000_000, "num"),
+    ("load_factor",          re.compile(r"^load factor$", re.I),                1,         "pct"),
+    ("yield_cents",          re.compile(r"^yield$", re.I),                      1,         "cents"),
+    ("rasm",                 re.compile(r"^RASM$", re.I),                       1,         "cents"),
+    ("casm_ex_fuel",         re.compile(r"CASMex|CASM excluding fuel", re.I),  1,         "cents"),
+    ("fuel_cost_per_gallon", re.compile(r"economic fuel cost per gallon", re.I), 1,        "dollar"),
+    ("fuel_gallons",         re.compile(r"fuel gallons\s*\(000,000\)", re.I),   1_000_000, "num"),
+]
 
 
 def _fetch_submissions() -> dict:
-    cache_path = RAW_DIR / "edgar_submissions.json"
-    if cache_path.exists():
-        return json.loads(cache_path.read_text())
-
+    cache = RAW_DIR / "edgar_submissions.json"
+    if cache.exists():
+        return json.loads(cache.read_text())
     url = f"https://data.sec.gov/submissions/CIK{CIK}.json"
     resp = requests.get(url, headers=EDGAR_HEADERS, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(data))
+    cache.write_text(json.dumps(data))
     return data
 
 
-def _get_traffic_8k_filings(submissions: dict) -> list[dict]:
-    """Return list of {accn, filed, primaryDocument} for monthly traffic 8-Ks."""
-    recent = submissions.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    accns = recent.get("accessionNumber", [])
-    dates = recent.get("filingDate", [])
-    descriptions = recent.get("primaryDocDescription", [])
-    documents = recent.get("primaryDocument", [])
-    items = recent.get("items", [])
-
-    traffic_filings = []
-    for form, accn, date, desc, doc, item in zip(
-        forms, accns, dates, descriptions, documents, items
-    ):
-        if form != "8-K":
-            continue
-        year = int(date[:4])
-        if year < START_YEAR:
-            continue
-        # Traffic stat 8-Ks are filed under item 7.01 (Reg FD) with "traffic" in description
-        desc_lower = (desc or "").lower()
-        item_str = str(item)
-        if "traffic" in desc_lower or ("7.01" in item_str and "traffic" in desc_lower):
-            traffic_filings.append({"accn": accn, "filed": date, "doc": doc})
-
-    # Fallback: if description matching finds nothing, broaden to all 7.01 items
-    if not traffic_filings:
-        for form, accn, date, desc, doc, item in zip(
-            forms, accns, dates, descriptions, documents, items
-        ):
-            if form != "8-K":
-                continue
-            year = int(date[:4])
-            if year < START_YEAR:
-                continue
-            if "7.01" in str(item):
-                traffic_filings.append({"accn": accn, "filed": date, "doc": doc})
-
-    return traffic_filings
+def _find_earnings_filings(submissions: dict) -> list[dict]:
+    """Return earnings 8-K filings (item 2.02) from START_YEAR to present."""
+    r = submissions["filings"]["recent"]
+    results = []
+    for form, accn, date, item in zip(r["form"], r["accessionNumber"], r["filingDate"], r["items"]):
+        if form == "8-K" and "2.02" in str(item) and int(date[:4]) >= START_YEAR:
+            results.append({"accn": accn, "filed": date})
+    return results
 
 
-def _fetch_filing_html(accn: str, doc: str) -> str:
+def _get_exhibit_url(accn: str) -> str | None:
+    """Find the EX-99.1 exhibit URL in a filing's index."""
     accn_clean = accn.replace("-", "")
-    url = f"https://www.sec.gov/Archives/edgar/data/{int(CIK)}/{accn_clean}/{doc}"
-    resp = requests.get(url, headers=EDGAR_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
-
-
-def _parse_number(text: str) -> float | None:
-    """Extract numeric value from a table cell, handling commas and parentheses."""
-    text = text.strip().replace(",", "").replace("%", "").replace(" pts", "")
-    text = text.replace("(", "-").replace(")", "")
+    idx_url = f"https://www.sec.gov/Archives/edgar/data/766421/{accn_clean}/"
     try:
-        return float(text)
-    except ValueError:
+        resp = requests.get(idx_url, headers=EDGAR_HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException:
         return None
 
+    soup = BeautifulSoup(resp.text, "lxml")
+    candidates: list[tuple[int, str]] = []  # (priority, url)
 
-def _parse_traffic_html(html: str, filed: str) -> dict | None:
-    """Extract system-level traffic metrics from one 8-K HTML document."""
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        if "Archives" not in href or not href.endswith(".htm"):
+            continue
+        filename = href.split("/")[-1].lower()
+        # Priority 1: explicit ex-99.1 exhibit (filename starts with ex991 or ex-99)
+        if re.match(r"ex.?99.?1", filename):
+            candidates.append((1, f"https://www.sec.gov{href}"))
+        # Priority 2: filename contains "earnings" but is NOT the main 8-K cover
+        elif "earnings" in filename and not filename.startswith("alk8") and not filename.startswith("alk-"):
+            candidates.append((2, f"https://www.sec.gov{href}"))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def _parse_value(cell: str, vtype: str) -> float | None:
+    """Parse a table cell value based on its expected type."""
+    cell = cell.strip()
+    # Remove footnote markers like (a), (b), NM, —
+    cell = re.sub(r"^\([a-z]\)$", "", cell).strip()
+    if cell in ("—", "NM", "", "nm"):
+        return None
+
+    if vtype == "cents":
+        # "17.30¢" or "17.30" (cents per ASM)
+        m = re.search(r"([\d.]+)", cell.replace(",", ""))
+        return float(m.group(1)) if m else None
+
+    if vtype == "pct":
+        # "86.5%" → 86.5
+        m = re.search(r"([\d.]+)", cell.replace(",", ""))
+        return float(m.group(1)) if m else None
+
+    if vtype == "dollar":
+        # "$3.66" → 3.66
+        m = re.search(r"[\$]?\s*([\d.]+)", cell.replace(",", ""))
+        return float(m.group(1)) if m else None
+
+    if vtype == "num":
+        # "16,349" → 16349
+        m = re.search(r"([\d,]+)", cell.replace(",", ""))
+        return float(m.group(1).replace(",", "")) if m else None
+
+    return None
+
+
+def _parse_ops_table(html: str) -> dict | None:
+    """
+    Find and parse the OPERATING STATISTICS SUMMARY table.
+    Returns dict of metric → quarterly value (Three Months Ended column).
+    """
     soup = BeautifulSoup(html, "lxml")
-
-    # Find the table with ASM/RPM data — look for tables with >3 rows
-    result: dict = {"filed": filed}
-    found_any = False
+    target_table = None
 
     for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if len(rows) < 3:
+        text = table.get_text(" ", strip=True)
+        if re.search(r"operating statistics summary", text, re.I) or (
+            re.search(r"RASM", text) and re.search(r"ASMs?\s*\(000,000\)", text)
+        ):
+            target_table = table
+            break
+
+    if target_table is None:
+        return None
+
+    # Parse each row into a list of cell strings, filtering out empty/footnote-only rows
+    rows: list[list[str]] = []
+    for tr in target_table.find_all("tr"):
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+        cells = [c for c in cells if c]
+        if cells:
+            rows.append(cells)
+
+    # Find which column is the "current quarter" value.
+    # The header row typically has: [label_col, current_q, prior_q, change, current_ytd, ...]
+    # We want column index 1 (0-indexed after label).
+    # Skip rows that look like section headers or footnotes.
+    result: dict = {}
+
+    # Narrow to "Consolidated Operating Statistics" section only
+    in_consolidated = False
+    for row in rows:
+        label = row[0]
+
+        if re.search(r"consolidated operating statistics", label, re.I):
+            in_consolidated = True
+            continue
+        if in_consolidated and re.search(r"(mainline|regional) operating statistics", label, re.I):
+            break  # stop at mainline/regional sections
+
+        if not in_consolidated:
             continue
 
-        # Determine column index for "current month" vs "prior year" — we want column 1
-        for row in rows:
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
+        for col_name, pattern, multiplier, vtype in METRICS:
+            # Strip footnote markers from label before matching
+            clean_label = re.sub(r"\([a-z]\)", "", label).strip()
+            if not pattern.search(clean_label):
                 continue
-            label = cells[0].get_text(strip=True)
-
-            for metric, pattern in METRIC_PATTERNS.items():
-                if not pattern.search(label):
-                    continue
-
-                # Detect unit multiplier from label (e.g., "(millions)")
-                multiplier = 1
-                for unit_re, mult in UNIT_PATTERNS.items():
-                    if unit_re.search(label):
-                        multiplier = mult
-                        break
-
-                val = _parse_number(cells[1].get_text())
-                if val is not None:
-                    if metric in ("asm", "rpm", "passengers", "departures"):
-                        result[metric] = val * multiplier
-                    else:
-                        result[metric] = val  # load_factor is a percent, no multiplier
-                    found_any = True
+            # Value is in the first data cell after the label (column index 1)
+            if len(row) < 2:
                 break
+            # Some rows have a footnote marker as cell[1]; skip it
+            val_idx = 1
+            if len(row) > 2 and re.fullmatch(r"\([a-z]\)", row[val_idx].strip()):
+                val_idx = 2
+            val = _parse_value(row[val_idx], vtype)
+            if val is not None and col_name not in result:
+                if multiplier != 1:
+                    result[col_name] = val * multiplier
+                else:
+                    result[col_name] = val
+            break
 
-    return result if found_any else None
+    return result if result else None
 
 
-def _infer_period(filed: str, html: str) -> tuple[int, int] | None:
-    """Infer the reporting month/year from filing date or document text."""
-    # Traffic 8-Ks are filed 1-4 weeks after the reporting month ends
+def _infer_period_end(html: str, filed: str) -> pd.Timestamp | None:
+    """Infer the period-end date from the press release header text."""
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    # Look for "Three Months Ended [Month] [Day]," or "Quarter Ended ..."
+    m = re.search(
+        r"(?:three months|quarter)\s+ended\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})",
+        text, re.I
+    )
+    if m:
+        try:
+            return pd.to_datetime(f"{m.group(1)} {m.group(2)}, {m.group(3)}")
+        except Exception:
+            pass
+
+    # Fallback: look for "Q[1-4] 20XX" in the title
+    m2 = re.search(r"Q([1-4])\s+20(\d{2})", text)
+    if m2:
+        q, yr = int(m2.group(1)), int(m2.group(2)) + 2000
+        month_map = {1: 3, 2: 6, 3: 9, 4: 12}
+        return pd.Timestamp(year=yr, month=month_map[q], day=30 if month_map[q] in (6, 9) else 31)
+
+    # Last resort: filing date minus ~3 weeks → approximate quarter end
     filed_dt = pd.Timestamp(filed)
-
-    # Look for explicit month/year in the HTML
-    months = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
-    }
-    text_lower = html[:5000].lower()
-    for month_name, month_num in months.items():
-        m = re.search(rf"{month_name}\s+(\d{{4}})", text_lower)
-        if m:
-            year = int(m.group(1))
-            if 2010 <= year <= 2030:
-                return year, month_num
-
-    # Fallback: reporting month is the month before the filing date
-    report_dt = filed_dt - pd.DateOffset(months=1)
-    return report_dt.year, report_dt.month
+    approx = filed_dt - pd.DateOffset(weeks=3)
+    month_map = {1: 12, 2: 12, 3: 3, 4: 3, 5: 3, 6: 6, 7: 6, 8: 6, 9: 9, 10: 9, 11: 9, 12: 12}
+    yr_adj = approx.year - (1 if approx.month == 12 and approx.month < filed_dt.month else 0)
+    end_month = month_map[approx.month]
+    end_day = 31 if end_month == 12 else (30 if end_month in (6, 9) else 31)
+    return pd.Timestamp(year=yr_adj, month=end_month, day=end_day)
 
 
 def run() -> pd.DataFrame:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Fetching EDGAR submission list...")
+    print("Loading EDGAR submissions...")
     submissions = _fetch_submissions()
 
-    filings = _get_traffic_8k_filings(submissions)
-    print(f"Found {len(filings)} candidate traffic 8-Ks (from {START_YEAR}+)")
+    earnings = _find_earnings_filings(submissions)
+    print(f"Found {len(earnings)} quarterly earnings 8-Ks from {START_YEAR}+")
 
     rows = []
-    for i, f in enumerate(filings):
+    for i, filing in enumerate(earnings):
         try:
-            html = _fetch_filing_html(f["accn"], f["doc"])
-            record = _parse_traffic_html(html, f["filed"])
-            if record:
-                period = _infer_period(f["filed"], html)
-                if period:
-                    record["year"], record["month"] = period
-                    record["date"] = pd.Timestamp(year=period[0], month=period[1], day=1)
-                    rows.append(record)
-            time.sleep(0.11)  # EDGAR polite crawl rate: ≤10 req/s
-        except Exception as e:
-            print(f"  Skip {f['accn']}: {e}")
+            ex_url = _get_exhibit_url(filing["accn"])
+            if ex_url is None:
+                continue
 
-        if (i + 1) % 20 == 0:
-            print(f"  Processed {i + 1}/{len(filings)}")
+            html = requests.get(ex_url, headers=EDGAR_HEADERS, timeout=30).text
+            stats = _parse_ops_table(html)
+            if stats:
+                period_end = _infer_period_end(html, filing["filed"])
+                if period_end is not None:
+                    stats["period_end"] = period_end
+                    stats["filed"] = filing["filed"]
+                    rows.append(stats)
+
+            time.sleep(0.12)
+
+        except Exception as e:
+            print(f"  Skip {filing['accn']} ({filing['filed']}): {e}")
+
+        if (i + 1) % 10 == 0:
+            print(f"  Processed {i + 1}/{len(earnings)}")
 
     if not rows:
-        raise RuntimeError("No traffic stats parsed — check filing format or EDGAR connectivity.")
+        raise RuntimeError("No operating stats parsed — check exhibit URL resolution or HTML structure.")
 
     df = pd.DataFrame(rows)
-    df = df.sort_values("date").drop_duplicates(subset="date", keep="last")
+    df["period_end"] = pd.to_datetime(df["period_end"])
+    df = df.sort_values("period_end").drop_duplicates(subset="period_end", keep="last")
+    df["fy"] = df["period_end"].dt.year
+    month_to_fp = {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}
+    df["fp"] = df["period_end"].dt.month.map(month_to_fp)
     df = df.reset_index(drop=True)
 
     out = PROCESSED_DIR / "traffic_stats.parquet"
     df.to_parquet(out, index=False)
-    print(f"Saved {len(df)} months of traffic stats → {out}")
-    print(df.tail(6).to_string())
+    print(f"\nSaved {len(df)} quarters of operating stats → {out}")
+    display_cols = ["period_end", "fp", "asm", "rpm", "load_factor", "rasm", "casm_ex_fuel"]
+    display_cols = [c for c in display_cols if c in df.columns]
+    print(df[display_cols].tail(8).to_string())
     return df
 
 
