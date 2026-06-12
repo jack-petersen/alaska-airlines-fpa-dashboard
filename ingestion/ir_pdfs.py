@@ -1,12 +1,10 @@
 """
-Fetch Alaska Air Group quarterly operating statistics from earnings press releases.
+Fetch Alaska Air Group quarterly operating statistics and revenue breakdown
+from earnings press releases (EX-99.1 exhibits on 8-K item 2.02 filings).
 
-Alaska files earnings 8-Ks (item 2.02) with an EX-99.1 press release that contains
-an "OPERATING STATISTICS SUMMARY" table with RASM, CASMex, ASMs, RPMs, load factor,
-fuel cost per gallon, and fuel gallons.  We extract the "Three Months Ended" column
-(not the YTD column) to get quarterly data aligned with the financial model.
-
-Saves to data/processed/traffic_stats.parquet.
+Produces two outputs:
+  data/processed/traffic_stats.parquet   — ASMs, RPMs, RASM, CASMex, load factor, fuel
+  data/processed/revenue_breakdown.parquet — passenger rev, Mileage Plan rev, cargo/other
 
 Run: python -m ingestion.ir_pdfs
 """
@@ -203,6 +201,67 @@ def _parse_ops_table(html: str) -> dict | None:
     return result if result else None
 
 
+def _parse_revenue_table(html: str) -> dict | None:
+    """
+    Extract quarterly revenue breakdown from the financial results table.
+
+    Looks for a table containing 'Passenger revenue' and 'Mileage plan' rows.
+    Returns dict with passenger_rev_m, mileage_plan_rev_m, cargo_other_rev_m,
+    total_rev_m — all in $M.
+
+    Table row formats vary by year:
+      With $-cell:    ["Passenger revenue", "$", "2,615", ...]  → value at index 2
+      Without $-cell: ["Mileage plan other revenue", "146", ...]  → value at index 1
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    for table in soup.find_all("table"):
+        text = table.get_text(" ", strip=True)
+        if not (re.search(r"passenger revenue", text, re.I)
+                and re.search(r"mileage plan", text, re.I)):
+            continue
+
+        rows: list[list[str]] = []
+        for tr in table.find_all("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+            cells = [c for c in cells if c]
+            if cells:
+                rows.append(cells)
+
+        result: dict = {}
+        targets = {
+            "passenger_rev_m":    re.compile(r"^passenger revenue$", re.I),
+            "mileage_plan_rev_m": re.compile(r"mileage plan", re.I),
+            "cargo_other_rev_m":  re.compile(r"cargo and other", re.I),
+            "total_rev_m":        re.compile(r"total operating revenues?", re.I),
+        }
+
+        for row in rows:
+            if not row:
+                continue
+            label = re.sub(r"\([a-z]\)", "", row[0]).strip()
+            for col_name, pattern in targets.items():
+                if col_name in result or not pattern.search(label):
+                    continue
+                # First data value: skip a lone "$" cell if present
+                val_idx = 1
+                if len(row) > 2 and row[val_idx].strip() in ("$", "$ "):
+                    val_idx = 2
+                if val_idx >= len(row):
+                    break
+                raw = row[val_idx].replace(",", "").replace("$", "").strip()
+                try:
+                    result[col_name] = float(raw)
+                except ValueError:
+                    pass
+                break
+
+        if "passenger_rev_m" in result:
+            return result
+
+    return None
+
+
 def _infer_period_end(html: str, filed: str) -> pd.Timestamp | None:
     """Infer the period-end date from the press release header text."""
     soup = BeautifulSoup(html, "lxml")
@@ -246,7 +305,9 @@ def run() -> pd.DataFrame:
     earnings = _find_earnings_filings(submissions)
     print(f"Found {len(earnings)} quarterly earnings 8-Ks from {START_YEAR}+")
 
-    rows = []
+    ops_rows: list[dict] = []
+    rev_rows: list[dict] = []
+
     for i, filing in enumerate(earnings):
         try:
             ex_url = _get_exhibit_url(filing["accn"])
@@ -254,13 +315,19 @@ def run() -> pd.DataFrame:
                 continue
 
             html = requests.get(ex_url, headers=EDGAR_HEADERS, timeout=30).text
+            period_end = _infer_period_end(html, filing["filed"])
+            if period_end is None:
+                continue
+
+            meta = {"period_end": period_end, "filed": filing["filed"]}
+
             stats = _parse_ops_table(html)
             if stats:
-                period_end = _infer_period_end(html, filing["filed"])
-                if period_end is not None:
-                    stats["period_end"] = period_end
-                    stats["filed"] = filing["filed"]
-                    rows.append(stats)
+                ops_rows.append({**stats, **meta})
+
+            rev = _parse_revenue_table(html)
+            if rev:
+                rev_rows.append({**rev, **meta})
 
             time.sleep(0.12)
 
@@ -270,24 +337,29 @@ def run() -> pd.DataFrame:
         if (i + 1) % 10 == 0:
             print(f"  Processed {i + 1}/{len(earnings)}")
 
-    if not rows:
-        raise RuntimeError("No operating stats parsed — check exhibit URL resolution or HTML structure.")
+    def _finalise(rows: list[dict], label: str) -> pd.DataFrame:
+        if not rows:
+            raise RuntimeError(f"No {label} parsed — check exhibit URL resolution.")
+        df = pd.DataFrame(rows)
+        df["period_end"] = pd.to_datetime(df["period_end"])
+        df = df.sort_values("period_end").drop_duplicates(subset="period_end", keep="last")
+        df["fy"] = df["period_end"].dt.year
+        df["fp"] = df["period_end"].dt.month.map({3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"})
+        return df.reset_index(drop=True)
 
-    df = pd.DataFrame(rows)
-    df["period_end"] = pd.to_datetime(df["period_end"])
-    df = df.sort_values("period_end").drop_duplicates(subset="period_end", keep="last")
-    df["fy"] = df["period_end"].dt.year
-    month_to_fp = {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}
-    df["fp"] = df["period_end"].dt.month.map(month_to_fp)
-    df = df.reset_index(drop=True)
+    df_ops = _finalise(ops_rows, "operating stats")
+    out_ops = PROCESSED_DIR / "traffic_stats.parquet"
+    df_ops.to_parquet(out_ops, index=False)
+    print(f"\nSaved {len(df_ops)} quarters of operating stats → {out_ops}")
 
-    out = PROCESSED_DIR / "traffic_stats.parquet"
-    df.to_parquet(out, index=False)
-    print(f"\nSaved {len(df)} quarters of operating stats → {out}")
-    display_cols = ["period_end", "fp", "asm", "rpm", "load_factor", "rasm", "casm_ex_fuel"]
-    display_cols = [c for c in display_cols if c in df.columns]
-    print(df[display_cols].tail(8).to_string())
-    return df
+    df_rev = _finalise(rev_rows, "revenue breakdown")
+    out_rev = PROCESSED_DIR / "revenue_breakdown.parquet"
+    df_rev.to_parquet(out_rev, index=False)
+    print(f"Saved {len(df_rev)} quarters of revenue breakdown → {out_rev}")
+    print(df_rev[["period_end","fp","passenger_rev_m","mileage_plan_rev_m",
+                   "cargo_other_rev_m","total_rev_m"]].tail(8).to_string())
+
+    return df_ops
 
 
 if __name__ == "__main__":

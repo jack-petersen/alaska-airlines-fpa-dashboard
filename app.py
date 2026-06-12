@@ -58,6 +58,16 @@ def load_fuel_prices() -> pd.DataFrame:
 
 
 @st.cache_data
+def load_revenue_breakdown() -> pd.DataFrame:
+    path = PROCESSED / "revenue_breakdown.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    df["period_end"] = pd.to_datetime(df["period_end"])
+    return df
+
+
+@st.cache_data
 def load_traffic() -> pd.DataFrame:
     path = PROCESSED / "traffic_stats.parquet"
     if not path.exists():
@@ -70,6 +80,7 @@ def load_traffic() -> pd.DataFrame:
 financials = load_financials()
 fuel_prices = load_fuel_prices()
 traffic = load_traffic()
+rev_breakdown = load_revenue_breakdown()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -394,6 +405,116 @@ elif section == "Unit Economics":
     # ── Raw data ───────────────────────────────────────────────────────────────
     with st.expander("Raw data"):
         st.dataframe(df_t.sort_values("period_end").reset_index(drop=True),
+                     use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — Ancillary Revenue
+# ══════════════════════════════════════════════════════════════════════════════
+elif section == "Ancillary Revenue":
+    st.title("Ancillary Revenue")
+    st.caption("Mileage Plan (loyalty + co-brand credit card), bag fees, and cargo — the non-ticket revenue lines.")
+
+    if rev_breakdown.empty:
+        st.error("Run `python -m ingestion.ir_pdfs` first.")
+        st.stop()
+
+    year_range = st.slider(
+        "Fiscal Year", min_value=int(rev_breakdown["fy"].min()),
+        max_value=int(rev_breakdown["fy"].max()),
+        value=(int(rev_breakdown["fy"].min()), int(rev_breakdown["fy"].max())),
+        key="anc_years",
+    )
+    df = rev_breakdown[
+        (rev_breakdown["fy"] >= year_range[0]) & (rev_breakdown["fy"] <= year_range[1])
+    ].copy()
+
+    df["ancillary_m"] = df["mileage_plan_rev_m"].fillna(0) + df["cargo_other_rev_m"].fillna(0)
+    df["mp_pct_total"] = df["mileage_plan_rev_m"] / df["total_rev_m"] * 100
+
+    # Join ASMs for per-unit metrics
+    trf_slim = traffic[["fy","fp","asm"]].copy()
+    df = df.merge(trf_slim, on=["fy","fp"], how="left")
+    df["mp_per_asm"] = df["mileage_plan_rev_m"] / df["asm"] * 100  # cents per ASM
+
+    # ── KPI cards ──────────────────────────────────────────────────────────────
+    latest = df.sort_values("period_end").iloc[-1]
+    prior  = df.sort_values("period_end").iloc[-2]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Mileage Plan Rev (latest qtr)", f"${latest['mileage_plan_rev_m']:.0f}M",
+              f"{latest['mileage_plan_rev_m'] - prior['mileage_plan_rev_m']:+.0f}M")
+    k2.metric("MP % of Total Revenue", f"{latest['mp_pct_total']:.1f}%",
+              f"{latest['mp_pct_total'] - prior['mp_pct_total']:+.1f} pts")
+    k3.metric("Cargo & Other (latest qtr)", f"${latest['cargo_other_rev_m']:.0f}M",
+              f"{latest['cargo_other_rev_m'] - prior['cargo_other_rev_m']:+.0f}M")
+    if pd.notna(latest.get("mp_per_asm")):
+        k4.metric("Mileage Plan per ASM", f"{latest['mp_per_asm']:.2f}¢")
+
+    st.divider()
+
+    # ── Stacked revenue mix ────────────────────────────────────────────────────
+    st.subheader("Revenue Mix — Quarterly ($M)")
+    fig_mix = go.Figure()
+    fig_mix.add_bar(x=df["period_end"], y=df["passenger_rev_m"],
+                    name="Passenger", marker_color=ALASKA_TEAL)
+    fig_mix.add_bar(x=df["period_end"], y=df["mileage_plan_rev_m"],
+                    name="Mileage Plan", marker_color=ALASKA_GOLD)
+    fig_mix.add_bar(x=df["period_end"], y=df["cargo_other_rev_m"],
+                    name="Cargo & Other", marker_color=ALASKA_BLUE)
+    fig_mix.update_layout(**CHART_DEFAULTS, barmode="stack",
+                          yaxis_title="$M", xaxis_title="")
+    st.plotly_chart(fig_mix, use_container_width=True)
+
+    # ── Mileage Plan resilience ────────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Mileage Plan Revenue ($M)")
+        st.caption("COVID resilience: MP fell only 38% vs passenger revenue's 85% decline in Q2 2020.")
+        fig_mp = go.Figure()
+        fig_mp.add_scatter(x=df["period_end"], y=df["mileage_plan_rev_m"],
+                           mode="lines+markers", name="Mileage Plan",
+                           line=dict(color=ALASKA_GOLD, width=2.5),
+                           fill="tozeroy", fillcolor="rgba(232,184,75,0.15)")
+        fig_mp.update_layout(**CHART_DEFAULTS, yaxis_title="$M")
+        st.plotly_chart(fig_mp, use_container_width=True)
+
+    with c2:
+        st.subheader("Mileage Plan as % of Total Revenue")
+        st.caption("Share rises in downturns — MP is a natural hedge to flight demand shocks.")
+        fig_pct = go.Figure()
+        fig_pct.add_bar(x=df["period_end"], y=df["mp_pct_total"],
+                        name="MP %",
+                        marker_color=[ALASKA_GOLD if v >= 10 else ALASKA_TEAL
+                                      for v in df["mp_pct_total"]])
+        fig_pct.update_layout(**CHART_DEFAULTS, yaxis_title="%")
+        st.plotly_chart(fig_pct, use_container_width=True)
+
+    # ── YoY growth by line ─────────────────────────────────────────────────────
+    st.subheader("Year-over-Year Revenue Growth by Line (%)")
+    df_yoy = df.copy().sort_values("period_end")
+    for col in ["passenger_rev_m", "mileage_plan_rev_m", "cargo_other_rev_m"]:
+        df_yoy[f"{col}_yoy"] = df_yoy.groupby("fp")[col].pct_change() * 100
+
+    fig_yoy = go.Figure()
+    colors_yoy = {"passenger_rev_m_yoy": ALASKA_TEAL,
+                  "mileage_plan_rev_m_yoy": ALASKA_GOLD,
+                  "cargo_other_rev_m_yoy": ALASKA_BLUE}
+    labels_yoy = {"passenger_rev_m_yoy": "Passenger",
+                  "mileage_plan_rev_m_yoy": "Mileage Plan",
+                  "cargo_other_rev_m_yoy": "Cargo & Other"}
+    for col, color in colors_yoy.items():
+        d = df_yoy.dropna(subset=[col])
+        fig_yoy.add_scatter(x=d["period_end"], y=d[col],
+                            name=labels_yoy[col], mode="lines+markers",
+                            line=dict(color=color, width=1.5))
+    fig_yoy.add_hline(y=0, line_dash="dash", line_color="#aaa")
+    fig_yoy.update_layout(**CHART_DEFAULTS, yaxis_title="% YoY", xaxis_title="",
+                          yaxis=dict(ticksuffix="%"))
+    st.plotly_chart(fig_yoy, use_container_width=True)
+
+    with st.expander("Raw data"):
+        st.dataframe(df.sort_values("period_end").reset_index(drop=True),
                      use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
