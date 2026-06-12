@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from models.unit_economics import add_q4
+from models.scenarios import Baseline, run_scenario
 
 PROCESSED = Path(__file__).parent / "data" / "processed"
 
@@ -555,6 +556,185 @@ elif section == "Fuel Analysis":
                 "fuel_pct_revenue", "fuel_cost_per_gallon", "fuel_gallons"]
         show = [c for c in show if c in df.columns]
         st.dataframe(df[show].reset_index(drop=True), use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — Scenario Planner
+# ══════════════════════════════════════════════════════════════════════════════
+elif section == "Scenario Planner":
+    st.title("Scenario Planner")
+    st.caption("Model the P&L impact of fuel price shocks, load factor changes, and hedge coverage.")
+
+    if traffic.empty or financials.empty:
+        st.error("Run ingestion scripts first.")
+        st.stop()
+
+    # ── Build baseline options from quarters with complete data ────────────────
+    fin_q = financials[financials["fp"].isin(["Q1","Q2","Q3","Q4"])].copy()
+    trf_q = traffic.copy()
+    merged = fin_q.merge(
+        trf_q[["fy","fp","fuel_cost_per_gallon","fuel_gallons","asm",
+               "yield_cents","load_factor","rasm","casm_ex_fuel"]],
+        on=["fy","fp"], how="inner"
+    ).dropna(subset=["fuel_cost_per_gallon","fuel_gallons","asm",
+                     "yield_cents","rasm","casm_ex_fuel"])
+    merged["period_end"] = pd.to_datetime(merged["period_end"])
+    merged = merged.sort_values("period_end")
+
+    if merged.empty:
+        st.error("No quarters with complete data for scenario baseline.")
+        st.stop()
+
+    # Quarter selector
+    quarter_labels = [
+        f"{r.fy} {r.fp}  (RASM {r.rasm:.2f}¢, LF {r.load_factor:.1f}%, ${r.fuel_cost_per_gallon:.2f}/gal)"
+        for r in merged.itertuples()
+    ]
+    default_idx = len(quarter_labels) - 1
+    selected = st.selectbox("Baseline quarter", quarter_labels, index=default_idx)
+    row = merged.iloc[quarter_labels.index(selected)]
+
+    bl = Baseline(
+        fuel_cost_per_gallon=row["fuel_cost_per_gallon"],
+        fuel_gallons=row["fuel_gallons"],
+        asm=row["asm"],
+        yield_cents=row["yield_cents"],
+        load_factor=row["load_factor"],
+        rasm=row["rasm"],
+        casm_ex_fuel=row["casm_ex_fuel"],
+        operating_income_m=row.get("operating_income", 0) or 0,
+        revenue_m=row["revenue_total"],
+    )
+
+    st.divider()
+
+    # ── Sliders ────────────────────────────────────────────────────────────────
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        fuel_chg = st.slider("Fuel price change (%)", -50, +100, 0, step=5,
+                             help="% change from baseline economic fuel cost/gallon")
+    with col_s2:
+        lf_delta = st.slider("Load factor (± pts)", -15, +15, 0, step=1,
+                             help="Percentage-point change from baseline load factor")
+    with col_s3:
+        hedge = st.slider("Hedge ratio (%)", 0, 100, 0, step=5,
+                          help="% of fuel consumption locked at baseline price (not exposed to price shock)") / 100
+
+    result = run_scenario(bl, fuel_chg, lf_delta, hedge)
+
+    st.divider()
+
+    # ── KPI output cards ───────────────────────────────────────────────────────
+    st.subheader("Scenario Output")
+
+    def _color(v: float) -> str:
+        return "normal" if v >= 0 else "inverse"
+
+    def _sign(v: float) -> str:
+        return f"+${abs(v):.0f}M" if v >= 0 else f"-${abs(v):.0f}M"
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "Annual Cash Impact",
+        _sign(result.annual_cash_impact_m),
+        delta_color=_color(result.annual_cash_impact_m),
+    )
+    k2.metric(
+        "Quarterly Op. Income Δ",
+        _sign(result.delta_operating_income_m),
+        delta_color=_color(result.delta_operating_income_m),
+    )
+    k3.metric(
+        "New RASM",
+        f"{result.new_rasm:.2f}¢",
+        f"{result.new_rasm - bl.rasm:+.2f}¢",
+        delta_color=_color(result.new_rasm - bl.rasm),
+    )
+    k4.metric(
+        "New CASM (total)",
+        f"{result.new_casm:.2f}¢",
+        f"{result.new_casm - (bl.casm_ex_fuel + bl.fuel_cost_per_gallon * bl.fuel_gallons / bl.asm * 100):+.2f}¢",
+        delta_color=_color(-(result.new_casm - (bl.casm_ex_fuel + bl.fuel_cost_per_gallon * bl.fuel_gallons / bl.asm * 100))),
+    )
+
+    # ── Waterfall chart ────────────────────────────────────────────────────────
+    st.subheader("P&L Impact Waterfall — Quarterly ($M)")
+
+    baseline_oi = bl.operating_income_m
+    fuel_bar    = result.fuel_contribution_m       # positive = benefit (e.g. fuel drops)
+    lf_bar      = result.load_factor_contribution_m
+    new_oi      = baseline_oi + result.delta_operating_income_m
+
+    labels  = ["Baseline Op. Income", "Fuel Price Impact", "Load Factor Impact", "New Op. Income"]
+    values  = [baseline_oi, fuel_bar, lf_bar, new_oi]
+    colors  = [
+        ALASKA_TEAL,
+        RED if fuel_bar < 0 else ALASKA_GREEN,
+        RED if lf_bar < 0 else ALASKA_GREEN,
+        ALASKA_TEAL if new_oi >= 0 else RED,
+    ]
+
+    # Build waterfall manually so it renders cleanly
+    measures = ["absolute", "relative", "relative", "total"]
+    fig_wf = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=measures,
+        x=labels,
+        y=values,
+        connector=dict(line=dict(color="#ccc", width=1)),
+        decreasing=dict(marker_color=RED),
+        increasing=dict(marker_color=ALASKA_GREEN),
+        totals=dict(marker_color=ALASKA_TEAL),
+        text=[f"${v:+.0f}M" if i in (1,2) else f"${v:.0f}M" for i, v in enumerate(values)],
+        textposition="outside",
+    ))
+    fig_wf.update_layout(
+        **CHART_DEFAULTS,
+        yaxis_title="$M",
+        yaxis_zeroline=True,
+        showlegend=False,
+    )
+    st.plotly_chart(fig_wf, use_container_width=True)
+
+    # ── Unit economics comparison table ───────────────────────────────────────
+    st.subheader("Unit Economics: Baseline vs Scenario")
+    comp = pd.DataFrame({
+        "Metric": ["RASM (¢/ASM)", "CASM ex-fuel (¢/ASM)", "CASM total (¢/ASM)", "Load Factor (%)"],
+        "Baseline": [
+            f"{bl.rasm:.2f}¢",
+            f"{bl.casm_ex_fuel:.2f}¢  ← unchanged",
+            f"{bl.casm_ex_fuel + bl.fuel_cost_per_gallon * bl.fuel_gallons / bl.asm * 100:.2f}¢",
+            f"{bl.load_factor:.1f}%",
+        ],
+        "Scenario": [
+            f"{result.new_rasm:.2f}¢",
+            f"{result.new_casm_ex_fuel:.2f}¢  ← unchanged",
+            f"{result.new_casm:.2f}¢",
+            f"{result.new_load_factor:.1f}%",
+        ],
+        "Delta": [
+            f"{result.new_rasm - bl.rasm:+.2f}¢",
+            "—",
+            f"{result.new_casm - (bl.casm_ex_fuel + bl.fuel_cost_per_gallon * bl.fuel_gallons / bl.asm * 100):+.2f}¢",
+            f"{lf_delta:+.1f} pts",
+        ],
+    })
+    st.dataframe(comp, use_container_width=True, hide_index=True)
+
+    # ── Methodology note ───────────────────────────────────────────────────────
+    with st.expander("Methodology"):
+        st.markdown(f"""
+**Fuel shock:** Only the unhedged fraction `(1 − hedge ratio)` of gallons is exposed to the
+price change. Delta fuel spend = baseline $/gal × gallons × (1 − hedge) × Δ%.
+
+**Load factor shock:** Revenue changes via RASM = Yield × ΔLF/100. Incremental
+passengers carry a {MARGINAL_COST_RATE:.0%} marginal cost rate (fuel, catering, fees),
+so {1-MARGINAL_COST_RATE:.0%} flows to EBITDA.
+
+**CASMex is explicitly held constant** — it reflects non-fuel unit costs (labor,
+maintenance, overhead) which are not modelled here.
+
+**Annual cash impact** = quarterly EBITDA delta × 4 (assumes conditions persist).
+""")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PLACEHOLDER sections
