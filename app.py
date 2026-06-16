@@ -95,19 +95,25 @@ routes = load_routes()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-ALASKA_BLUE  = "#00205B"
-ALASKA_GREEN = "#01426A"
+_dark = st.get_option("theme.base") == "dark"
+_font_color = st.get_option("theme.textColor") or ("#e0e0e0" if _dark else "#222")
+_grid_color = "rgba(255,255,255,0.10)" if _dark else "rgba(0,0,0,0.07)"
+
+ALASKA_BLUE  = "#A8D8F0" if _dark else "#00205B"   # midnight navy → light ice blue in dark
+ALASKA_GREEN = "#2BA4B0" if _dark else "#01426A"   # dark teal → lighter teal in dark
 ALASKA_TEAL  = "#0085CA"
 ALASKA_GOLD  = "#E8B84B"
 RED          = "#C8102E"
 
 CHART_DEFAULTS = dict(
-    plot_bgcolor="white",
-    paper_bgcolor="white",
-    font_color="#222",
+    plot_bgcolor="rgba(0,0,0,0)",
+    paper_bgcolor="rgba(0,0,0,0)",
+    font_color=_font_color,
     margin=dict(l=0, r=0, t=36, b=0),
     legend=dict(orientation="h", y=-0.15),
     hovermode="x unified",
+    xaxis_gridcolor=_grid_color,
+    yaxis_gridcolor=_grid_color,
 )
 
 
